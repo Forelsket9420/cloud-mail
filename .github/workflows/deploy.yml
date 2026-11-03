@@ -1,0 +1,89 @@
+name: Deploy cloud-mail (auto deploy + migrate)
+
+# Push mail-worker/mail-vue -> deploy with mail-worker/wrangler.toml
+# (which already carries the real d1/kv bindings and the hourly cron),
+# then run the DB migration and verify. Nothing else to do by hand.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "mail-worker/**"
+      - "mail-vue/**"
+  workflow_dispatch:
+
+concurrency:
+  group: cloud-mail-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build, deploy and migrate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: "./mail-worker/pnpm-lock.yaml"
+
+      - name: Install dependencies
+        working-directory: ./mail-worker
+        run: pnpm install --frozen-lockfile
+
+      - name: Check required secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "Missing secret: CLOUDFLARE_API_TOKEN"; exit 1; fi
+          if [ -z "$JWT_SECRET" ]; then echo "Missing secret: JWT_SECRET"; exit 1; fi
+          case "$JWT_SECRET" in *\?*|*\%*|*\#*|*/*|*\\*) echo "JWT_SECRET contains ?, %, #, / or backslash, which breaks the init URL. Reset it in Cloudflare dashboard and update the secret."; exit 1;; esac
+          echo "Secrets present."
+
+      - name: Deploy to Cloudflare Workers
+        working-directory: ./mail-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: "49a5b0adbf6938d9f890984b1a655904"
+        run: pnpm wrangler deploy
+
+      - name: Run database migration
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          echo "Waiting for deployment to propagate..."
+          for i in 1 2 3 4 5 6; do
+            BODY=$(curl -sL "https://mail.loveoi.com/api/init/${JWT_SECRET}" || true)
+            if [ "$BODY" = "success" ]; then
+              echo "Migration completed."
+              exit 0
+            fi
+            echo "Attempt $i: got '$BODY', retrying in 15s..."
+            sleep 15
+          done
+          echo "Migration failed after retries."
+          exit 1
+
+      - name: Verify service
+        run: |
+          RESP=$(curl -s "https://mail.loveoi.com/api/setting/websiteConfig" || true)
+          echo "$RESP" | grep -q '"code":200' || { echo "websiteConfig check failed: $RESP"; exit 1; }
+          echo "websiteConfig OK."
+
+      - name: Check cron schedule (warning only)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: "49a5b0adbf6938d9f890984b1a655904"
+        run: |
+          SCHED=$(curl -s -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/cloud-mail/schedules" || true)
+          echo "$SCHED" | grep -q '0 \* \* \* \*' && echo "Hourly cron present." || echo "::warning::Hourly cron not found in schedules, please check Cloudflare dashboard."
